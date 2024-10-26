@@ -1,0 +1,9 @@
+[submodule "third_party/mujoco_menagerie"]
+	path = third_party/mujoco_menagerie
+	url = git@github.com:mimic-labs/mujoco_menagerie.git
+[submodule "third_party/sam2"]
+	path = third_party/sam2
+	url = git@github.com:mimic-labs/sam2.git
+[submodule "third_party/RAFT-Stereo"]
+	path = third_party/RAFT-Stereo
+	url = git@github.com:mimic-labs/RAFT-Stereo.git
