@@ -16,8 +16,9 @@ from tqdm import tqdm
 
 ########################## SAM2/DinoV2 Initializations ##########################
 def initialize_sam2(device):
-    sam2_checkpoint = "../third_party/segment-anything-2/checkpoints/sam2_hiera_base_plus.pt"
-    model_cfg = "sam2_hiera_b+.yaml"
+    sam2_checkpoint = "./third_party/sam2/checkpoints/sam2.1_hiera_large.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+
     sam2 = build_sam2(model_cfg, sam2_checkpoint, device=device, apply_postprocessing=False)
 
     mask_predictor = SAM2AutomaticMaskGenerator(sam2)
@@ -40,6 +41,8 @@ def generate_masks(mask_generator, prompted_predictor, image_path, point_prompt=
     image_path: path of image
     point_prompt: np.array(n,2), where n is # of points
     box_prompt: np.array(n,4), where n is # of boxes
+    More info on input prompts:
+        https://github.com/facebookresearch/sam2/blob/c2ec8e14a185632b0a5d8b161928ceb50197eddc/sam2/sam2_image_predictor.py#L353
     """
     image = Image.open(image_path)
     image = np.array(image.convert("RGB"))
@@ -54,7 +57,7 @@ def generate_masks(mask_generator, prompted_predictor, image_path, point_prompt=
             point_coords=point_prompt,
             box=box_prompt,
             multimask_output=True,
-            point_labels=np.array([1]*len(point_prompt)),
+            point_labels=torch.ones(point_prompt.shape[:2]),
         )
         torch.cuda.empty_cache()
 
@@ -82,20 +85,23 @@ def create_mask_images(original_image, masks):
     """
     original_image_array = np.array(original_image)
     all_cropped_imgs = []
-
-    for i in range(masks.shape[0]):
-        mask = masks[i, :, :]
-        if isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask)
-        np_mask = mask.unsqueeze(dim=2).numpy()
-        masked_img = (original_image_array * np_mask).astype(np.uint8)  # Convert to uint8
-        ys, xs = np.where(mask)
-        if ys.size == 0 or xs.size == 0:
-            continue
-        bbox = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
-        cropped_image_array = masked_img[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1, :]
-        cropped_image_pil = Image.fromarray(cropped_image_array)
-        all_cropped_imgs.append(cropped_image_pil)
+    B,N,_,_ = masks.shape
+    for i in range(B):
+        per_batch = []
+        for j in range(N):
+            mask = masks[i, j, :, :]
+            if isinstance(mask, np.ndarray):
+                mask = torch.from_numpy(mask)
+            np_mask = mask.unsqueeze(dim=2).numpy()
+            masked_img = (original_image_array * np_mask).astype(np.uint8)  # Convert to uint8
+            ys, xs = np.where(mask)
+            if ys.size == 0 or xs.size == 0:
+                continue
+            bbox = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+            cropped_image_array = masked_img[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1, :]
+            cropped_image_pil = Image.fromarray(cropped_image_array)
+            per_batch.append(cropped_image_pil)
+        all_cropped_imgs.append(per_batch)
 
     return all_cropped_imgs
 ################################################################################
@@ -147,12 +153,12 @@ def get_obj_embeddings(model, cropped_obj):
 ########################## General Helper Functions ##########################
 def calculate_simmatrix(a, b, eps=1e-8):
     """
-    a: NxD
+    a: BxNxD
     b: MxD
     
     out: NxM, each row contains how similar N_i is to each M
     """
-    a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+    a_n, b_n = a.norm(dim=-1,keepdim=True), b.norm(dim=-1,keepdim=True)
     a_norm = a / torch.max(a_n, eps * torch.ones_like(a_n))
     b_norm = b / torch.max(b_n, eps * torch.ones_like(b_n))
     sim_mt = a_norm @ b_norm.T
@@ -165,7 +171,7 @@ def match_ref_and_query(query_embeddings, reference_embeddings):
 
     """
     similarities = calculate_simmatrix(query_embeddings, reference_embeddings)
-    matched_ref_masks, matched_ref_masks_idx = torch.max(similarities, dim=1)
+    matched_ref_masks, matched_ref_masks_idx = torch.max(similarities, dim=-1)
     # self.matched_query_masks = self.query_masks[matched_query_masks_idx, :, :]
     # self.matched_query_patch_embeddings = self.query_patch_embeddings[matched_query_masks_idx, :, :]
     return matched_ref_masks_idx, matched_ref_masks
@@ -202,7 +208,7 @@ def generate_heatmap(distances, mask, grid_size, image_size):
     distances = distances.reshape(grid_size)
     mask = mask.reshape(grid_size)
     heatmap_np = distances.numpy()
-    heatmap_np *= -1
+    heatmap_np *= -1 #convert distance matrix -> similarity matrix
     heatmap_np = (heatmap_np - np.min(heatmap_np)) / (np.max(heatmap_np) - np.min(heatmap_np))
     heatmap_np[~mask] = 0
 
@@ -237,41 +243,61 @@ def get_corresponding_contacts(ref, query, contact_point):
     """
     ref: reference ImageResults
     query: query ImageResults
-    contact_point: [x,y] in full reference image space
+    contact_point: list([B,#ofptsperbatch,2]); [x,y] in full reference image space
 
     ref and query should now contain 3 new attributes each:
     - image_with_contact: image with contact_point draw (corresponding point if it is the query image)
     - cropped_image_space_coords: contact point [x,y] wrt cropped image
     - orig_image_space_coords: contact point [x,y] wrt full/original image
     """
-    best = ref.top3BestIdx
 
     ref.image_with_contact = ref.orig_image.copy()
-    draw = ImageDraw.Draw(ref.image_with_contact)
-    ys, xs = np.where(ref.mask[best])
-    box_x, box_y = np.min(xs), np.min(ys)
-    col, row = contact_point
-    draw.ellipse([col-10, row-10, col+10, row+10], fill=(255, 0, 0))
-    
-    contact_pt = [row-box_y,col-box_x] # [row, col] = [y, x]
-    ref.cropped_image_space_coords = contact_pt[::-1]
-    ref.orig_image_space_coords = contact_point
-    
-    query_mask = make_foreground_mask(query.image_tensor[best])
-    idx = source_position_to_idx(contact_pt[0], contact_pt[1], ref.scales[best])
-    matched_idx, distances = closest_embedding(ref.cropped_image_tokens[best][[idx], :], query.cropped_image_tokens[best], query_mask, method="")
-    heatmap, heatmap_np = generate_heatmap(distances, query_mask, query.scales[best][0], query.cropped_image[best].size)
-    row, col = idx_to_source_position(matched_idx, query.scales[best])
-    query.heatmap = heatmap
-    query.heatmap_np = heatmap_np
-    
     query.image_with_contact = query.orig_image.copy()
-    draw = ImageDraw.Draw(query.image_with_contact)
-    ys, xs = np.where(query.mask[best])
-    box_x, box_y = np.min(xs), np.min(ys)
-    draw.ellipse([box_x+col-10, box_y+row-10, box_x+col+10, box_y+row+10], fill=(255, 0, 0))
-    query.cropped_image_space_coords = [col,row]
-    query.orig_image_space_coords = [box_x+col, box_y+row]
+    ref.cropped_image_space_coords = []
+    ref.orig_image_space_coords = []
+    query.cropped_image_space_coords = []
+    query.orig_image_space_coords = []
+    query.heatmap = []
+    query.heatmap_np = []
+    
+    for best in range(len(contact_point)):
+        refcropped_image_space_coords_pb = []
+        reforig_image_space_coords_pb = []
+        querycropped_image_space_coords_pb = []
+        queryorig_image_space_coords = []
+        queryheatmap_pb = []
+        queryheatmap_np_pb = []
+        for pt in contact_point[best]:
+            draw = ImageDraw.Draw(ref.image_with_contact)
+            ys, xs = np.where(ref.mask[best])
+            box_x, box_y = np.min(xs), np.min(ys)
+            col, row = pt
+            draw.ellipse([col-10, row-10, col+10, row+10], fill=(255, 0, 0))
+            
+            contact_pt = [row-box_y,col-box_x] # [row, col] = [y, x]
+            refcropped_image_space_coords_pb.append(contact_pt[::-1])
+            reforig_image_space_coords_pb.append(pt)
+            
+            query_mask = make_foreground_mask(query.image_tensor[best])
+            idx = source_position_to_idx(contact_pt[0], contact_pt[1], ref.scales[best])
+            matched_idx, distances = closest_embedding(ref.cropped_image_tokens[best][[idx], :], query.cropped_image_tokens[best], query_mask, method="")
+            heatmap, heatmap_np = generate_heatmap(distances, query_mask, query.scales[best][0], query.cropped_image[best].size)
+            row, col = idx_to_source_position(matched_idx, query.scales[best])
+            queryheatmap_pb.append(heatmap)
+            queryheatmap_np_pb.append(heatmap_np)
+            
+            draw = ImageDraw.Draw(query.image_with_contact)
+            ys, xs = np.where(query.mask[best])
+            box_x, box_y = np.min(xs), np.min(ys)
+            draw.ellipse([box_x+col-10, box_y+row-10, box_x+col+10, box_y+row+10], fill=(255, 0, 0))
+            querycropped_image_space_coords_pb.append([col,row])
+            queryorig_image_space_coords.append([box_x+col, box_y+row])
+        ref.cropped_image_space_coords.append(refcropped_image_space_coords_pb)
+        ref.orig_image_space_coords.append(reforig_image_space_coords_pb)
+        query.cropped_image_space_coords.append(querycropped_image_space_coords_pb)
+        query.orig_image_space_coords.append(queryorig_image_space_coords)
+        query.heatmap.append(queryheatmap_pb)
+        query.heatmap_np.append(queryheatmap_np_pb)
     
 ###############################################################################################################################################
 
@@ -283,7 +309,7 @@ class ImageResults:
         self.cropped_image = cropped_image # cropped mask PIL image (this could be either selected mask or matched mask image)
         self.image_tensor = image_tensor # post transformation image tensor
         self.mask = mask # binary mask of mask in image
-        self.cropped_image_cls = cropped_image_cls # 1x768
+        self.cropped_image_cls = cropped_image_cls # 1x768, embedding_dim=768
         self.cropped_image_tokens = cropped_image_tokens # Nx768, N = # of 14x14 blocks
         self.scales = scales
 
@@ -310,7 +336,7 @@ def get_mask1_bestmask2(models, image_path1, image_path2, pos_points):
     """
     models = (dinov2, mask_predictor, prompted_predictor)
 
-    pos_points: np.array(N,2) of points, generally it will look like np.array([[475,280]])
+    pos_points: torch.tensor(B,N,2) of points
 
     Returns mask in image1 and best corresponding mask in image2
     """
@@ -319,11 +345,8 @@ def get_mask1_bestmask2(models, image_path1, image_path2, pos_points):
     image2 = Image.open(image_path2)
 
     # Mask Generation
-    # TODO 1: Ability to press "n" points and/or boxes and get "n" masks. Right now, it just outputs 1 mask.
-    # TODO 2: For each pressed mask, get top 3 masks (which should be default) and compute similarity for each. take max of max
-
     masks1, scores, logits = generate_masks(mask_predictor, prompted_predictor, image_path1, point_prompt=pos_points) # point prompt for image1
-    best_mask1 = masks1 #after: top 3 masks before: top 1 mask[[np.argmax(scores)]] 
+    best_mask1 = masks1 if len(masks1.shape)==4 else masks1[None,:,:,:] #after: top 3 masks before: top 1 mask[[np.argmax(scores)]] 
     masks2 = generate_masks(mask_predictor, prompted_predictor, image_path2) # get all masks in image2
     masks2 = np.array([mask['segmentation'] for mask in masks2])
     torch.cuda.empty_cache()
@@ -331,20 +354,26 @@ def get_mask1_bestmask2(models, image_path1, image_path2, pos_points):
     print("done with mask generation")
     
     # PIL.Image Generation from masks
-    cropped_images1 = create_mask_images(image1, best_mask1)
-    cropped_images2 = create_mask_images(image2, masks2)
+    cropped_images1 = create_mask_images(image1, best_mask1) #[B, 3]
+    cropped_images2 = create_mask_images(image2, masks2[None,:,:,:])[0]
 
     # Calculate DinoV2 embeddings for all masks and get best match in image2
     # query_tokens, query_cls, query_scales = get_obj_embeddings(dinov2, cropped_images1[0])
     # query_cls = queries_cls.unsqueeze(0) #get embedding for touched mask in image1; 1,768
-    query_embs = [get_obj_embeddings(dinov2, c) for c in cropped_images1]
-    query_tokens, query_cls, query_scales, query_image_tensor = zip(*query_embs)
-    query_tokens = list(query_tokens)
-    query_cls = torch.stack(list(query_cls))
-    query_scales = list(query_scales)
-    query_image_tensor = list(query_image_tensor)
-    torch.cuda.empty_cache()
-    gc.collect()
+    query_tokens = []
+    query_cls = []
+    query_scales = [] 
+    query_image_tensor = []
+
+    for batch in cropped_images1:
+        query_embs = [get_obj_embeddings(dinov2, c) for c in batch]
+        qt, qc, qs, qit = zip(*query_embs)
+        query_tokens.append(list(qt))
+        query_cls.append(torch.stack(list(qc)))
+        query_scales.append(list(qs))
+        query_image_tensor.append(list(qit))
+        torch.cuda.empty_cache()
+        gc.collect()
 
     refs_embs = []
     for i, c in enumerate(tqdm(cropped_images2)):
@@ -357,13 +386,20 @@ def get_mask1_bestmask2(models, image_path1, image_path2, pos_points):
     refs_scales = list(refs_scales)
     refs_image_tensor = list(refs_image_tensor)
     
-    # TODO 2b: Match each of the 3 ref masks with all query masks and find best match per mask. Then get best match by taking max
-    idxs, maxs = match_ref_and_query(query_cls, refs_cls) # for each query, match to 1 reference
-    best = torch.argmax(maxs).item() # best score out of top score for each of the 3 masks
-    print(f"Out of the top 3 masks, the best one was {best}")
-    idxs = idxs.numpy() #idxs[best].numpy()
-    resultsIm1 = ImageResults(image1, cropped_images1, query_image_tensor, best_mask1, query_tokens, query_cls, query_scales, pos_points=pos_points)
-    resultsIm1.top3BestIdx = best
+    idxs, maxs = match_ref_and_query(torch.stack(query_cls), refs_cls) #[B, 3] for each batch, for each query, match to 1 reference
+    best = torch.argmax(maxs, dim=-1) # best score out of top score for each of the 3 masks
+    print(f"Out of the top 3 masks, the best ones were {best.tolist()} (index per batch)")
+    idxs = idxs[np.arange(len(idxs)), best].numpy() # shape: [B,]
+    
+    resultsIm1 = ImageResults(image1, 
+                              [cropped_images1[i][best[i]] for i in range(len(best))], 
+                              [query_image_tensor[i][best[i]] for i in range(len(best))], 
+                              [best_mask1[i][best[i]] for i in range(len(best))], 
+                              [query_tokens[i][best[i]] for i in range(len(best))], 
+                              [query_cls[i][best[i]] for i in range(len(best))], 
+                              [query_scales[i][best[i]] for i in range(len(best))], 
+                              pos_points=pos_points)
+    
     resultsIm2 = ImageResults(image2, 
                               [cropped_images2[idx] for idx in idxs],
                               [refs_image_tensor[idx] for idx in idxs],
