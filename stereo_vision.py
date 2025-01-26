@@ -66,7 +66,12 @@ def undistortImg(img, origmtx, dist, newcameramtx, roi, crop=True):
     """
     img: cv2 image
     crop: should return crop to ROI (region of interest) or not
+
+    NOTE: if you want to find inverse mapping (undistorted -> distorted), use:
+    initUndistortRectifyMap and remap separately. That way we get the mapx, mapy which are 
+    inverse mappings anyways. So it would provide mapping from undistorted -> distorted.
     """
+
     dst = cv2.undistort(img, origmtx, dist, None, newcameramtx)
     
     # crop the image
@@ -126,7 +131,7 @@ def compute_relative_extrinsics(R1: tuple, T1: np.ndarray, R2: tuple, T2: np.nda
     Computes the relative extrinsic parameters (rotation and translation) between two cameras.
     """
 
-    R_relative = np.dot(R2, np.linalg.inv(R1))
+    R_relative = np.dot(R2, np.linalg.inv(R1)) #how to get from cam1 -> cam2 coords
     T_relative = T2 - R_relative @ T1
 
     return R_relative, T_relative
@@ -138,6 +143,8 @@ def buildQ(K, T_relative):
                      [0.0, 0.0, -1/np.linalg.norm(T_relative), 0.0]])
 
 #test
+
+# 1. GET INTRINSIC MATRIX FOR CAMERA1 & CAMERA2 (should be the same matrix since they are the same camera type)
 objpoints, imgpoints, shapeOfCalibImg = findObjImgPoints("calibrationPhotos", draw=False)
 
 ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, shapeOfCalibImg[::-1], None, None)
@@ -149,17 +156,19 @@ for i in range(len(objpoints)):
  
 print( "total error: {}".format(mean_error/len(objpoints)) )
 
+# 2. UNDISTORT IMAGES (assuming there is distortion predicted from previous step)
 h, w = shapeOfCalibImg[:2]
 newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w,h), 1, (w,h))
-
-R1_w2c, T1_w2c = getExtrinsics("leftreal.JPG", mtx, dist)
-R2_w2c, T2_w2c = getExtrinsics("rightreal.JPG", mtx, dist)
 
 img_lefto = cv2.imread("leftreal.JPG")
 img_left = undistortImg(img_lefto, mtx, dist, newcameramtx, roi)
 
 img_right = cv2.imread("rightreal.JPG")
 img_right = undistortImg(img_right, mtx, dist, newcameramtx, roi)
+
+# 3. GET EXTRINSIC MATRICES FOR BOTH CAMERAS
+R1_w2c, T1_w2c = getExtrinsics("leftreal.JPG", mtx, dist)
+R2_w2c, T2_w2c = getExtrinsics("rightreal.JPG", mtx, dist)
 
 Kl = newcameramtx
 Kr = newcameramtx
@@ -171,40 +180,45 @@ R1o = R1_w2c
 R2o = R2_w2c
 
 R, T = compute_relative_extrinsics(R1o, T1, R2o, T2)
+
+# 4a. STEREO RECTIFY THE TWO CAMERA'S IMAGES (optional)
 R1, R2, P1, P2, Q, validRoi1, validRoi2 = cv2.stereoRectify(Kl, Dl, Kr, Dr, img_left.shape[:2][::-1], R, T)
 xmap1, ymap1 = cv2.initUndistortRectifyMap(Kl, Dl, R1, P1, img_left.shape[:2][::-1], cv2.CV_32FC1)
 xmap2, ymap2 = cv2.initUndistortRectifyMap(Kr, Dr, R2, P2, img_left.shape[:2][::-1], cv2.CV_32FC1)
 left_img_rectified = cv2.remap(img_left, xmap1, ymap1, cv2.INTER_LINEAR)
 right_img_rectified = cv2.remap(img_right, xmap2, ymap2, cv2.INTER_LINEAR)
+
+# 4b. CAMERAS ARE ALREADY RECTIFIED. BUILD Q MATRIX.
+# Q = buildQ(Kl, T)
+
 ################ The above is to create rectified images so it can be fed into our disparity predictor ################
 
 class DepthCalculation:
     def __init__(self):
-        self.net = None
+        self.model = None
         self.pc_world = None
         self.pc_cam = None
 
     def load_model(self):
-        self.net = self.initRAFTModel("cuda:0")
+        self.model = self.initRAFTModel("cuda:0")
 
     def preprocess(self, img1, img2):
         image1, origshape = self.load_image(img1)
         image2, origshape = self.load_image(img2)
         
-        # TODO 2: Put this into a function
-        padder = InputPadder(image1.shape, divis_by=32)
-        image1, image2 = padder.pad(image1, image2)
+        self.padder = InputPadder(image1.shape, divis_by=32)
+        image1, image2 = self.padder.pad(image1, image2)
         return image1, image2
 
     def postprocess(self, flow_up):
+        flow_up = self.padder.unpad(flow_up).squeeze()
         return -1.0*flow_up.detach().cpu().numpy().squeeze()
 
     def compute_disparity(self, image1, image2):
         img1, img2 = self.preprocess(image1,image2)
         
         with torch.no_grad():
-            _, flow_up = model(img1, img2, iters=32, test_mode=True)
-        flow_up = padder.unpad(flow_up).squeeze()
+            _, flow_up = self.model(img1, img2, iters=32, test_mode=True)
         
         disparity = self.postprocess(flow_up)
         return disparity
@@ -215,28 +229,26 @@ class DepthCalculation:
         if rectifyRotation is not None:
             realPoints3dcam = np.linalg.inv(rectifyRotation) @ points_3D[:,:,:,None]
         else: 
-            realPoints3dcam = points_3D
+            realPoints3dcam = points_3D[:,:,:,None]
     
         if weird:
-            realPoints3d = Rw2c @ realPoints3dcam + Tw2c # rotation_matrix_from_euler(R1_angles) @ realPoints3dcam + T1 #wtf is happening, wait nvm this may be right
-        else: 
-            realPoints3d = np.linalg.inv(Rw2c) @ (realPoints3dcam - Tw2c) # rotation_matrix_from_euler(R1_angles) @ realPoints3dcam + T1 #wtf is happening, wait nvm this may be right
+            realPoints3d = Rw2c @ realPoints3dcam + Tw2c 
+        else:
+            #what is the shape of the output? what is the shape of the input realPoints3dcam?
+            realPoints3d = np.linalg.inv(Rw2c) @ (realPoints3dcam - Tw2c)
         self.pc_world = realPoints3d
         self.pc_cam = realPoints3dcam
         return realPoints3d, realPoints3dcam
     
     def getXYZWorld(self, pixel):
-        x,y = pixel
-        return self.pc_world[y,x]
-
+        x,y = pixel 
+        return self.pc_world[y,x] # be careful about indexing, but im p sure this is right
+    
     def getXYZCam(self, pixel):
         x,y = pixel
         return self.pc_cam[y,x]
 
     def load_image(self, imfile, resize=None):
-        # img = np.array(Image.open(imfile)).astype(np.uint8)
-        # img = torch.from_numpy(img).permute(2, 0, 1).float()
-        # return img[None].to(DEVICE)
         if isinstance(imfile, str):
             origimg = cv2.imread(imfile)
         else:
@@ -268,7 +280,7 @@ class DepthCalculation:
         parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")
         parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
         parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
-        argss = "--restore_ckpt /nethome/abati7/flash/Work/mimic/third_party/RAFT-Stereo/models/raftstereo-middlebury.pth --corr_implementation alt --mixed_precision"
+        argss = "--restore_ckpt ./third_party/RAFT-Stereo/models/raftstereo-middlebury.pth --corr_implementation alt --mixed_precision"
         args = parser.parse_args(argss.split(" "))
         
         model = torch.nn.DataParallel(RAFTStereo(args), device_ids=[0])
@@ -279,32 +291,18 @@ class DepthCalculation:
         model.eval()
         return model
 
+# NOTE: All that is needed for this is Q, Rw2c, R_stereorectify, Tw2c
 depthCalc = DepthCalculation()
 depthCalc.load_model()
 disparity = depthCalc.compute_disparity(left_img_rectified,right_img_rectified)
 realPoints3dWorldView, realPoints3dCamView = depthCalc.getPointCloud(disparity, Q, R1, R1o, T1)
 
+# NOTE: realPoints3dWorldView is a mapping from undistorted image coords to 3d world coords
+# SO we would use: depthCalc.getXYZWorld(pixelXY)
 
-# model = initRAFTModel()
 
-# image1, origshape = load_image("leftstereo.png")
-# image2, origshape = load_image("rightstereo.png")
-
-# # TODO 2: Put this into a function
-# padder = InputPadder(image1.shape, divis_by=32)
-# image1, image2 = padder.pad(image1, image2)
-# with torch.no_grad():
-#     _, flow_up = model(image1, image2, iters=32, test_mode=True)
-# flow_up = padder.unpad(flow_up).squeeze()
-# flow_up = -flow_up.detach().cpu().numpy().squeeze()
-
-# realPoints3dWorldView, realPoints3dCamView = getPointCloud(flow_up, Q, R1, R1o, T1)
-
+# NOTE: Visualization stuff
 points_3D = realPoints3dWorldView.reshape((-1,3))
-# points_3D = realPoints3dCamView.reshape((-1,3))
-
-
-# TODO 3: Put this into a function for saving point cloud
 pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(points_3D)
 

@@ -39,8 +39,8 @@ def generate_masks(mask_generator, prompted_predictor, image_path, point_prompt=
     mask_generator: output of initialize_sam2 for all mask generation
     prompted_predictor: output of initialize_sam2 for box and points prompted generation
     image_path: path of image
-    point_prompt: np.array(n,2), where n is # of points
-    box_prompt: np.array(n,4), where n is # of boxes
+    point_prompt: np.array(b,n,2), where n is # of points
+    box_prompt: np.array(b,4), where n is # of boxes
     More info on input prompts:
         https://github.com/facebookresearch/sam2/blob/c2ec8e14a185632b0a5d8b161928ceb50197eddc/sam2/sam2_image_predictor.py#L353
     """
